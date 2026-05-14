@@ -6,7 +6,6 @@ import gzip
 import json
 import logging
 import os
-import platform
 import re
 import sys
 from abc import ABC, abstractmethod
@@ -524,7 +523,7 @@ class TestHttpBase(ABC):
             await download_handler.download_request(request)
         assert "download_latency" in request.meta
         latency = request.meta["download_latency"]
-        if sys.version_info < (3, 13) and platform.system() == "Windows":
+        if sys.version_info < (3, 13) and sys.platform == "win32":
             # time.monotonic() resolution is too low here:
             # https://docs.python.org/3/whatsnew/3.13.html#time
             assert latency >= 0
@@ -1266,3 +1265,69 @@ class TestMitmProxyBase(ABC):
     @staticmethod
     def _assert_got_auth_exception(log: str) -> None:
         assert "Proxy Authentication Required" in log or "407" in log
+
+
+class TestRealWebsiteBase(ABC):
+    @property
+    @abstractmethod
+    def download_handler_cls(self) -> type[DownloadHandlerProtocol]:
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def settings_dict(self) -> dict[str, Any] | None:
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def platform_cert_store_works(self) -> bool:
+        """Whether valid certificates can be verified.
+
+        Twisted on Windows cannot do that out of the box, see e.g.
+        https://github.com/twisted/twisted/issues/6371.
+        """
+        return True
+
+    @asynccontextmanager
+    async def get_dh(
+        self, settings_dict: dict[str, Any] | None = None
+    ) -> AsyncGenerator[DownloadHandlerProtocol]:
+        crawler = get_crawler(DefaultSpider, settings_dict)
+        crawler.spider = crawler._create_spider()
+        dh = build_from_crawler(self.download_handler_cls, crawler)
+        try:
+            yield dh
+        finally:
+            await dh.close()
+
+    @coroutine_test
+    async def test_download(self) -> None:
+        request = Request("https://books.toscrape.com/")
+        async with self.get_dh() as download_handler:
+            response = await download_handler.download_request(request)
+        assert response.status == 200
+        assert "All products | Books to Scrape - Sandbox" in response.text
+
+    @coroutine_test
+    async def test_download_with_spider(self) -> None:
+        crawler = get_crawler(SingleRequestSpider, self.settings_dict)
+        await maybe_deferred_to_future(
+            crawler.crawl(seed=Request("https://books.toscrape.com/"))
+        )
+        assert isinstance(crawler.spider, SingleRequestSpider)
+        failure = crawler.spider.meta.get("failure")
+        assert failure is None
+        reason = crawler.spider.meta["close_reason"]
+        assert reason == "finished"
+
+    @coroutine_test
+    async def test_verify_certs(self) -> None:
+        if not self.platform_cert_store_works:
+            pytest.skip("Cannot verify certificates")
+        request = Request("https://books.toscrape.com/")
+        async with self.get_dh(
+            {"DOWNLOAD_VERIFY_CERTIFICATES": True}
+        ) as download_handler:
+            response = await download_handler.download_request(request)
+        assert response.status == 200
+        assert "All products | Books to Scrape - Sandbox" in response.text
